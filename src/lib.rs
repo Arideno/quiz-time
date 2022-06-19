@@ -1,12 +1,18 @@
 use near_sdk::borsh::{BorshDeserialize, BorshSerialize};
 use near_sdk::collections::{LookupMap, UnorderedSet};
-use near_sdk::{near_bindgen, AccountId, PanicOnDefault, env};
+use near_sdk::{near_bindgen, AccountId, PanicOnDefault, env, BorshStorageKey};
 use near_sdk::serde::{Deserialize, Serialize};
+
+#[derive(BorshSerialize, BorshStorageKey)]
+enum StorageKey {
+    Quizzes,
+    Published
+}
 
 // 1 near prize
 const PRIZE_AMOUNT: u128 = 1_000_000_000_000_000_000_000_000;
 
-#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug)]
+#[derive(BorshDeserialize, BorshSerialize, Deserialize, Serialize, Debug, PartialEq)]
 #[serde(crate = "near_sdk::serde")]
 pub enum QuizStatus {
     Published,
@@ -15,8 +21,8 @@ pub enum QuizStatus {
 
 #[derive(Serialize)]
 #[serde(crate = "near_sdk::serde")]
-pub struct UnsolvedQuizzes {
-    puzzles: Vec<JsonQuiz>,
+pub struct PublishedQuizzes {
+    quizzes: Vec<JsonQuiz>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -40,6 +46,7 @@ pub struct Quiz {
 pub struct QuizContract {
     owner_id: AccountId,
     quizzes: LookupMap<String, Quiz>,
+    published_hashes: UnorderedSet<String>
 }
 
 #[near_bindgen]
@@ -48,7 +55,8 @@ impl QuizContract {
     pub fn new(owner_id: AccountId) -> Self {
         Self {
             owner_id,
-            quizzes: LookupMap::new(b"q"),
+            quizzes: LookupMap::new(StorageKey::Quizzes),
+            published_hashes: UnorderedSet::new(StorageKey::Published)
         }
     }
 
@@ -61,6 +69,10 @@ impl QuizContract {
         });
 
         assert!(existing_quiz.is_none(), "Quiz with the same hash already exists");
+
+        if publish {
+            self.published_hashes.insert(&hash);
+        }
     }
 
     pub fn get_quiz_status(&self, hash: String) -> Option<QuizStatus> {
@@ -77,9 +89,29 @@ impl QuizContract {
         self.check_owner();
 
         let mut quiz = self.quizzes.get(&hash).expect("No such quiz found");
-        quiz.status = QuizStatus::Published;
+        if quiz.status == QuizStatus::Unpublished {
+            quiz.status = QuizStatus::Published;
+            self.published_hashes.insert(&hash);
+        }
 
         self.quizzes.insert(&hash, &quiz);
+    }
+
+    pub fn get_published_quizzes(&self) -> PublishedQuizzes {
+        let hashes = self.published_hashes.to_vec();
+        let mut quizzes = vec![];
+        for hash in hashes {
+            let quiz = self.quizzes.get(&hash).unwrap_or_else(|| env::panic_str("Cannot load quiz"));
+            let json_quiz = JsonQuiz {
+                hash,
+                question: quiz.question,
+                answers: quiz.answers
+            };
+            quizzes.push(json_quiz);
+        }
+        PublishedQuizzes { 
+            quizzes
+        }
     }
 
     #[private]
