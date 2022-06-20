@@ -29,7 +29,8 @@ pub struct PublishedQuizzes {
 pub struct JsonQuiz {
     hash: String,
     question: String,
-    answers: Vec<String>
+    answers: Vec<String>,
+    prize_amount: String
 }
 
 #[derive(BorshDeserialize, BorshSerialize, Debug)]
@@ -171,7 +172,8 @@ impl QuizContract {
             let json_quiz = JsonQuiz {
                 hash,
                 question: quiz.question,
-                answers: quiz.answers
+                answers: quiz.answers,
+                prize_amount: quiz.max_prize_amount.to_string()
             };
             quizzes.push(json_quiz);
         }
