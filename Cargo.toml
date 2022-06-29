@@ -19,3 +19,4 @@ overflow-checks = true
 [dependencies]
 near-sdk = "4.0.0"
 borsh = "0.9.3"
+sha2 = "0.10.2"

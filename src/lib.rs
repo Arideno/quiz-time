@@ -2,6 +2,9 @@ use near_sdk::borsh::{BorshDeserialize, BorshSerialize};
 use near_sdk::collections::{LookupMap, UnorderedSet};
 use near_sdk::{near_bindgen, AccountId, PanicOnDefault, env, BorshStorageKey, Promise};
 use near_sdk::serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
+
+type QuizId = u64;
 
 #[derive(BorshSerialize, BorshStorageKey)]
 enum StorageKey {
@@ -27,9 +30,8 @@ pub struct PublishedQuizzes {
 #[derive(Serialize, Deserialize)]
 #[serde(crate = "near_sdk::serde")]
 pub struct JsonQuiz {
-    hash: String,
+    quiz_id: QuizId,
     question: String,
-    answers: Vec<String>,
     prize_amount: String
 }
 
@@ -37,8 +39,7 @@ pub struct JsonQuiz {
 pub struct Quiz {
     status: QuizStatus,
     question: String,
-    answers: Vec<String>,
-    correct_index: usize,
+    correct_hash: String,
     max_prize_amount: u128
 }
 
@@ -46,10 +47,11 @@ pub struct Quiz {
 #[derive(BorshSerialize, BorshDeserialize, PanicOnDefault)]
 pub struct QuizContract {
     owner_id: AccountId,
-    quizzes: LookupMap<String, Quiz>,
-    published_hashes: UnorderedSet<String>,
-    solved_quizzes: LookupMap<AccountId, UnorderedSet<String>>,
-    retries_left: LookupMap<AccountId, LookupMap<String, usize>>
+    quizzes: LookupMap<QuizId, Quiz>,
+    published_quiz_ids: UnorderedSet<QuizId>,
+    solved_quizzes: LookupMap<AccountId, UnorderedSet<QuizId>>,
+    retries_left: LookupMap<AccountId, LookupMap<QuizId, usize>>,
+    current_quiz_id: QuizId
 }
 
 #[near_bindgen]
@@ -59,14 +61,15 @@ impl QuizContract {
         Self {
             owner_id: owner_id,
             quizzes: LookupMap::new(StorageKey::Quizzes),
-            published_hashes: UnorderedSet::new(StorageKey::PublishedQuizzes),
+            published_quiz_ids: UnorderedSet::new(StorageKey::PublishedQuizzes),
             solved_quizzes: LookupMap::new(StorageKey::SolvedQuizzes),
-            retries_left: LookupMap::new(StorageKey::RetriesLeft)
+            retries_left: LookupMap::new(StorageKey::RetriesLeft),
+            current_quiz_id: 0
         }
     }
 
-    pub fn submit_answer(&mut self, hash: String, index: usize) -> String {
-        let quiz = self.quizzes.get(&hash).expect("No such quiz found");
+    pub fn submit_answer(&mut self, quiz_id: QuizId, answer: String) -> String {
+        let quiz = self.quizzes.get(&quiz_id).expect("No such quiz found");
         assert!(quiz.status == QuizStatus::Published, "Cannot submit an answer to unpublished quiz");
         let account_id = env::predecessor_account_id();
         let mut solved_quizzes_set = self.solved_quizzes.get(&account_id).unwrap_or_else(|| {
@@ -76,25 +79,27 @@ impl QuizContract {
             UnorderedSet::new(prefix)
         });
 
-        if solved_quizzes_set.contains(&hash) {
+        if solved_quizzes_set.contains(&quiz_id) {
             env::panic_str("This quiz is already solved by you");
         }
 
-        let mut retries_left_map: LookupMap<String, usize> = self.retries_left.get(&account_id).unwrap_or_else(|| {
+        let mut retries_left_map: LookupMap<QuizId, usize> = self.retries_left.get(&account_id).unwrap_or_else(|| {
             let mut prefix = Vec::with_capacity(33);
             prefix.push(b'r');
             prefix.extend(env::sha256(account_id.as_bytes()));
             LookupMap::new(prefix)
         });
 
-        let mut retries_left = retries_left_map.get(&hash).unwrap_or(3);
+        let mut retries_left = retries_left_map.get(&quiz_id).unwrap_or(3);
 
         if retries_left == 0 {
             env::panic_str("You can no longer solve this quiz. You are out of tries.");
         }
 
-        if index == quiz.correct_index {
-            solved_quizzes_set.insert(&hash);
+        let answer_hash = format!("{:x}", Sha256::digest(answer.as_bytes()));
+
+        if answer_hash == quiz.correct_hash {
+            solved_quizzes_set.insert(&quiz_id);
             self.solved_quizzes.insert(&account_id, &solved_quizzes_set);
 
             let amount = quiz.max_prize_amount / (4 - retries_left) as u128;
@@ -105,62 +110,66 @@ impl QuizContract {
         } else {
             retries_left -= 1;
 
-            retries_left_map.insert(&hash, &retries_left);
+            retries_left_map.insert(&quiz_id, &retries_left);
 
             self.retries_left.insert(&account_id, &retries_left_map);
 
             if retries_left == 0 {
-                return format!("The answer is not right, you are out of tries. The correct answer is `{}`", quiz.answers[quiz.correct_index]);
+                return format!("The answer is not right, you are out of tries");
             }
 
             return format!("The answer is not right. You have {} retries left", retries_left);
         }
     }
 
-    pub fn create_quiz(&mut self, hash: String, question: String, answers: Vec<String>, correct_index: usize, max_prize_amount: String, publish: bool) {
+    pub fn create_quiz(&mut self, question: String, correct_hash: String, max_prize_amount: String, publish: bool) -> QuizId {
         self.check_owner();
 
         let status = if publish { QuizStatus::Published } else { QuizStatus::Unpublished };
-        let existing_quiz = self.quizzes.insert(&hash, &Quiz {
-            question, answers, correct_index, max_prize_amount: max_prize_amount.parse::<u128>().unwrap(), status
+        let quiz_id = self.current_quiz_id;
+        let existing_quiz = self.quizzes.insert(&quiz_id, &Quiz {
+            question, correct_hash, max_prize_amount: max_prize_amount.parse::<u128>().unwrap(), status
         });
 
-        assert!(existing_quiz.is_none(), "Quiz with the same hash already exists");
+        assert!(existing_quiz.is_none(), "Quiz with the same quiz_id already exists");
 
         if publish {
-            self.published_hashes.insert(&hash);
+            self.published_quiz_ids.insert(&quiz_id);
         }
+
+        self.current_quiz_id += 1;
+
+        quiz_id
     }
 
-    pub fn get_quiz_status(&self, hash: String) -> Option<QuizStatus> {
-        if let Some(quiz) = self.quizzes.get(&hash) {
+    pub fn get_quiz_status(&self, quiz_id: QuizId) -> Option<QuizStatus> {
+        if let Some(quiz) = self.quizzes.get(&quiz_id) {
             return Some(quiz.status)
         }
 
         None
     }
 
-    pub fn publish_quiz(&mut self, hash: String) {
+    pub fn publish_quiz(&mut self, quiz_id: QuizId) {
         self.check_owner();
 
-        let mut quiz = self.quizzes.get(&hash).expect("No such quiz found");
+        let mut quiz = self.quizzes.get(&quiz_id).expect("No such quiz found");
         if quiz.status == QuizStatus::Unpublished {
             quiz.status = QuizStatus::Published;
-            self.published_hashes.insert(&hash);
+            self.published_quiz_ids.insert(&quiz_id);
         }
 
-        self.quizzes.insert(&hash, &quiz);
+        self.quizzes.insert(&quiz_id, &quiz);
     }
 
     pub fn get_published_quizzes(&self) -> PublishedQuizzes {
-        let hashes = self.published_hashes.to_vec();
+        let quiz_ids = self.published_quiz_ids.to_vec();
         let mut quizzes = vec![];
-        for hash in hashes {
-            let quiz = self.quizzes.get(&hash).unwrap_or_else(|| env::panic_str("Cannot load quiz"));
+        for quiz_id in quiz_ids {
+            let quiz = self.quizzes.get(&quiz_id).unwrap_or_else(|| env::panic_str("Cannot load quiz"));
             let json_quiz = JsonQuiz {
-                hash,
+                quiz_id,
                 question: quiz.question,
-                answers: quiz.answers,
                 prize_amount: quiz.max_prize_amount.to_string()
             };
             quizzes.push(json_quiz);
@@ -224,11 +233,11 @@ mod tests {
         testing_env!(context.build());
 
         let mut contract = QuizContract::new(account_id);
-        contract.create_quiz("1".to_owned(), "What is the capital of France".to_owned(), vec!["Kyiv".to_owned(), "Madrid".to_owned(), "Paris".to_owned(), "Berlin".to_owned()], 2, "1".to_owned(), true);
+        let quiz_id = contract.create_quiz("What is the capital of France".to_owned(), "5dd272b4f316b776a7b8e3d0894b37e1e42be3d5d3b204b8a5836cc50597a6b1".to_owned(), "1".to_owned(), true);
 
         let published_quizzes = contract.get_published_quizzes();
         assert_eq!(published_quizzes.quizzes.len(), 1);
-        assert_eq!(published_quizzes.quizzes[0].hash, "1");
+        assert_eq!(published_quizzes.quizzes[0].quiz_id, quiz_id);
     }
 
     #[test]
@@ -239,10 +248,10 @@ mod tests {
         testing_env!(context.build());
 
         let mut contract = QuizContract::new(account_id);
-        contract.create_quiz("1".to_owned(), "What is the capital of France".to_owned(), vec!["Kyiv".to_owned(), "Madrid".to_owned(), "Paris".to_owned(), "Berlin".to_owned()], 2, "1".to_owned(), true);
+        let quiz_id = contract.create_quiz("What is the capital of France".to_owned(), "5dd272b4f316b776a7b8e3d0894b37e1e42be3d5d3b204b8a5836cc50597a6b1".to_owned(), "1".to_owned(), true);
 
-        let quiz = contract.quizzes.get(&"1".to_owned()).unwrap();
-        assert_eq!(quiz.question, "What is the capital of France");
+        let quiz = contract.quizzes.get(&quiz_id).unwrap();
+        assert_eq!(quiz.question, "What is the capital of France".to_owned());
     }
 
     #[test]
@@ -263,7 +272,7 @@ mod tests {
         let context = get_context(alice, false);
         testing_env!(context.build());
 
-        contract.create_quiz("1".to_owned(), "What is the capital of France".to_owned(), vec!["Kyiv".to_owned(), "Madrid".to_owned(), "Paris".to_owned(), "Berlin".to_owned()], 2, "1".to_owned(), true);
+        contract.create_quiz("What is the capital of France".to_owned(), "5dd272b4f316b776a7b8e3d0894b37e1e42be3d5d3b204b8a5836cc50597a6b1".to_owned(), "1".to_owned(), true);
     }
 
     #[test]
@@ -275,11 +284,11 @@ mod tests {
 
         let mut contract = QuizContract::new(account_id);
 
-        contract.create_quiz("1".to_owned(), "What is the capital of France".to_owned(), vec!["Kyiv".to_owned(), "Madrid".to_owned(), "Paris".to_owned(), "Berlin".to_owned()], 2, "1".to_owned(), false);
-        assert_eq!(contract.get_quiz_status("1".to_owned()).unwrap(), QuizStatus::Unpublished);
+        let quiz_id = contract.create_quiz("What is the capital of France".to_owned(), "5dd272b4f316b776a7b8e3d0894b37e1e42be3d5d3b204b8a5836cc50597a6b1".to_owned(), "1".to_owned(), false);
+        assert_eq!(contract.get_quiz_status(quiz_id).unwrap(), QuizStatus::Unpublished);
 
-        contract.create_quiz("2".to_owned(), "What is the capital of France".to_owned(), vec!["Kyiv".to_owned(), "Madrid".to_owned(), "Paris".to_owned(), "Berlin".to_owned()], 2, "1".to_owned(), true);
-        assert_eq!(contract.get_quiz_status("2".to_owned()).unwrap(), QuizStatus::Published);
+        let quiz_id = contract.create_quiz("What is the capital of France".to_owned(), "5dd272b4f316b776a7b8e3d0894b37e1e42be3d5d3b204b8a5836cc50597a6b1".to_owned(), "1".to_owned(), true);
+        assert_eq!(contract.get_quiz_status(quiz_id).unwrap(), QuizStatus::Published);
     }
 
     #[test]
@@ -294,9 +303,9 @@ mod tests {
         testing_env!(context.build());
 
         let mut contract = QuizContract::new(account_id);
-        contract.create_quiz("1".to_owned(), "What is the capital of France".to_owned(), vec!["Kyiv".to_owned(), "Madrid".to_owned(), "Paris".to_owned(), "Berlin".to_owned()], 2, "1".to_owned(), false);
+        let quiz_id = contract.create_quiz("What is the capital of France".to_owned(), "5dd272b4f316b776a7b8e3d0894b37e1e42be3d5d3b204b8a5836cc50597a6b1".to_owned(), "1".to_owned(), false);
 
-        contract.submit_answer("1".to_owned(), 2);
+        contract.submit_answer(quiz_id, "Paris".to_owned());
     }
 
     #[test]
@@ -307,11 +316,11 @@ mod tests {
         testing_env!(context.build());
 
         let mut contract = QuizContract::new(account_id.clone());
-        contract.create_quiz("1".to_owned(), "What is the capital of France".to_owned(), vec!["Kyiv".to_owned(), "Madrid".to_owned(), "Paris".to_owned(), "Berlin".to_owned()], 2, "1".to_owned(), true);
+        let quiz_id = contract.create_quiz("What is the capital of France".to_owned(), "5dd272b4f316b776a7b8e3d0894b37e1e42be3d5d3b204b8a5836cc50597a6b1".to_owned(), "1".to_owned(), true);
 
-        contract.submit_answer("1".to_owned(), 2);
+        contract.submit_answer(quiz_id.clone(), "Paris".to_owned());
 
-        assert_eq!(contract.solved_quizzes.get(&account_id).unwrap().contains(&"1".to_owned()), true);
+        assert_eq!(contract.solved_quizzes.get(&account_id).unwrap().contains(&quiz_id), true);
     }
 
     #[test]
@@ -322,13 +331,13 @@ mod tests {
         testing_env!(context.build());
 
         let mut contract = QuizContract::new(account_id.clone());
-        contract.create_quiz("1".to_owned(), "What is the capital of France".to_owned(), vec!["Kyiv".to_owned(), "Madrid".to_owned(), "Paris".to_owned(), "Berlin".to_owned()], 2, "1".to_owned(), true);
+        let quiz_id = contract.create_quiz("What is the capital of France".to_owned(), "5dd272b4f316b776a7b8e3d0894b37e1e42be3d5d3b204b8a5836cc50597a6b1".to_owned(), "1".to_owned(), true);
 
-        contract.submit_answer("1".to_owned(), 1);
+        contract.submit_answer(quiz_id.clone(), "Berlin".to_owned());
 
-        assert_eq!(contract.retries_left.get(&account_id).unwrap().get(&"1".to_owned()).unwrap(), 2);
-        contract.submit_answer("1".to_owned(), 0);
-        assert_eq!(contract.retries_left.get(&account_id).unwrap().get(&"1".to_owned()).unwrap(), 1);
+        assert_eq!(contract.retries_left.get(&account_id).unwrap().get(&quiz_id).unwrap(), 2);
+        contract.submit_answer(quiz_id.clone(), "Madrid".to_owned());
+        assert_eq!(contract.retries_left.get(&account_id).unwrap().get(&quiz_id).unwrap(), 1);
     }
 
     #[test]
@@ -339,10 +348,10 @@ mod tests {
         testing_env!(context.build());
 
         let mut contract = QuizContract::new(account_id.clone());
-        contract.create_quiz("1".to_owned(), "What is the capital of France".to_owned(), vec!["Kyiv".to_owned(), "Madrid".to_owned(), "Paris".to_owned(), "Berlin".to_owned()], 2, "1".to_owned(), false);
+        let quiz_id = contract.create_quiz("What is the capital of France".to_owned(), "5dd272b4f316b776a7b8e3d0894b37e1e42be3d5d3b204b8a5836cc50597a6b1".to_owned(), "1".to_owned(), false);
 
-        assert_eq!(contract.quizzes.get(&"1".to_owned()).unwrap().status, QuizStatus::Unpublished);
-        contract.publish_quiz("1".to_owned());
-        assert_eq!(contract.quizzes.get(&"1".to_owned()).unwrap().status, QuizStatus::Published);
+        assert_eq!(contract.quizzes.get(&quiz_id).unwrap().status, QuizStatus::Unpublished);
+        contract.publish_quiz(quiz_id.clone());
+        assert_eq!(contract.quizzes.get(&quiz_id).unwrap().status, QuizStatus::Published);
     }
 }
