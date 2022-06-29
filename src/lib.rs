@@ -97,23 +97,11 @@ impl QuizContract {
             solved_quizzes_set.insert(&hash);
             self.solved_quizzes.insert(&account_id, &solved_quizzes_set);
 
-            let amount;
-
-            match retries_left {
-                1 | 2 => {
-                    amount = quiz.max_prize_amount / retries_left as u128;
-                },
-                3 => {
-                    amount = quiz.max_prize_amount;
-                }
-                _ => {
-                    amount = 0;
-                }
-            }
+            let amount = quiz.max_prize_amount / (4 - retries_left) as u128;
 
             Promise::new(account_id.clone()).transfer(amount);
 
-            return format!("Your answer is correct. You've got {} YOTA Nears", amount);
+            return format!("Your answer is correct. You've got {} yoctoNEAR", amount);
         } else {
             retries_left -= 1;
 
